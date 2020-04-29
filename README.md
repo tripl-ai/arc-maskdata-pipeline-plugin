@@ -1,4 +1,4 @@
-arc-maskdata-pipeline-plugin provides the MaskDataTransform stages.
+arc-maskdata-pipeline-plugin provides the MaskDataTransform stage.
 
 ## Documentation
 

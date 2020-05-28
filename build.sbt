@@ -1,7 +1,7 @@
 import Dependencies._
 
 lazy val scala211 = "2.11.12"
-lazy val scala212 = "2.12.10"
+lazy val scala212 = "2.12.11"
 lazy val supportedScalaVersions = List(scala211, scala212)
 
 lazy val root = (project in file(".")).
@@ -18,7 +18,16 @@ lazy val root = (project in file(".")).
     parallelExecution in Test := false,
     parallelExecution in IntegrationTest := false,
     fork in Test := true,
-    envVars in Test := Map("ETL_CONF_MASK_DATA_PASSPHRASE" -> "q7VqMTbj7e5dUWESfc8UjZr2r7pyq5cHP8MVkUEjyv74cHsqUt734vg6qQmHaz7a"),
+    envVars in Test := Map(
+      "ETL_CONF_MASK_DATA_PASSPHRASE" -> "q7VqMTbj7e5dUWESfc8UjZr2r7pyq5cHP8MVkUEjyv74cHsqUt734vg6qQmHaz7a",
+      "ETL_CONF_MASK_DATA_ARGON2_PARALLELISM" -> "2",
+      "ETL_CONF_MASK_DATA_ARGON2_MEMORY" -> "65536",
+      "ETL_CONF_MASK_DATA_ARGON2_ITERATIONS" -> "4",
+      "ETL_CONF_MASK_DATA_PBKDF2_ITERATIONS" -> "131072",
+      "ETL_CONF_MASK_DATA_SCRYPT_CPU" -> "32768",
+      "ETL_CONF_MASK_DATA_SCRYPT_MEMORY" -> "16",
+      "ETL_CONF_MASK_DATA_SCRYPT_PARALLELISM" -> "2"
+    ),
     fork in Test := true,
     buildInfoKeys := Seq[BuildInfoKey](version, scalaVersion),
     buildInfoPackage := "ai.tripl.arc.maskdata",

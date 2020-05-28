@@ -5,14 +5,12 @@ import java.nio.ByteBuffer
 import java.security.SecureRandom
 import java.sql.Date
 import java.sql.Timestamp
-import java.time.temporal.TemporalAdjusters._
 import java.time.temporal.ChronoUnit
+import java.time.temporal.TemporalAdjusters._
 import java.time.ZoneId
-import javax.crypto.SecretKeyFactory
-import javax.crypto.spec.PBEKeySpec
+import java.util.ServiceLoader
 import org.bouncycastle.crypto.generators._
 import org.bouncycastle.crypto.params._
-import org.apache.commons.codec.binary.Base32
 
 import scala.collection.JavaConverters._
 import scala.util.{Try, Success, Failure}
@@ -42,6 +40,7 @@ import ai.tripl.arc.util.EitherUtils._
 import ai.tripl.arc.util.HTTPUtils
 import ai.tripl.arc.util.Utils
 import ai.tripl.arc.util.Mask
+import ai.tripl.arc.transform.codec.Argon2Codec
 
 class MaskDataTransform extends PipelineStagePlugin {
 
@@ -52,8 +51,7 @@ class MaskDataTransform extends PipelineStagePlugin {
     import ai.tripl.arc.config.ConfigUtils._
     implicit val c = config
 
-    val envVar = "ETL_CONF_MASK_DATA_PASSPHRASE"
-    val signature = s"MaskDataTransform  environment variable '$envVar' must be a with a string with at least 64 characters."
+    val signature = s"MaskDataTransform environment variable '${MaskDataTransform.passphraseEnvironmentVariable}' must be a string of between 64 and 256 characters."
 
     val expectedKeys = "type" :: "name" :: "description" :: "environments" :: "inputView" :: "outputView" :: "persist" :: "params" :: Nil
     val name = getValue[String]("name")
@@ -64,15 +62,20 @@ class MaskDataTransform extends PipelineStagePlugin {
     val params = readMap("params", c)
     val invalidKeys = checkValidKeys(c)(expectedKeys)
 
+    // load codecs. these are not serializable so have to be re-initalised on each executor but are useful for logging
+    val serviceLoader = Utils.getContextOrSparkClassLoader
+    val maskDataTransformCodecs = ServiceLoader.load(classOf[MaskDataTransformCodec], serviceLoader).iterator().asScala.toList.map { codec => s"${codec.getClass.getName}:${codec.getVersion}" }
+    val codecs = if (maskDataTransformCodecs.length != 0) Right(maskDataTransformCodecs) else Left(ConfigError("MaskDataTransformCodec", None, "No codecs found to perform data masking.") :: Nil)
+
     // get the passphrase from an environment variable
-    val passphrase = envOrNone(envVar) match {
-      case Some(value) if (value.length < 64) => throw new Exception(s"${signature} Got ${value.length} characters.")
-      case Some(value) => Option(value)
-      case None => None
+    val passphrase = envOrNone(MaskDataTransform.passphraseEnvironmentVariable) match {
+      case Some(value) if (value.length < 64) || (value.length > 256) => Left(ConfigError(MaskDataTransform.passphraseEnvironmentVariable, None, signature) :: Nil)
+      case Some(value) => Right(Option(value))
+      case None => Right(None)
     }
 
-    (name, description, inputView, outputView, persist, invalidKeys) match {
-      case (Right(name), Right(description), Right(inputView), Right(outputView), Right(persist), Right(invalidKeys)) =>
+    (name, description, inputView, outputView, persist, passphrase, codecs, invalidKeys) match {
+      case (Right(name), Right(description), Right(inputView), Right(outputView), Right(persist), Right(passphrase), Right(codecs), Right(invalidKeys)) =>
 
         val stage = MaskDataTransformStage(
           plugin=this,
@@ -82,21 +85,26 @@ class MaskDataTransform extends PipelineStagePlugin {
           outputView=outputView,
           persist=persist,
           params=params,
-          passphrase=passphrase
+          passphrase=passphrase,
         )
 
         stage.stageDetail.put("inputView", inputView)
         stage.stageDetail.put("outputView", outputView)
         stage.stageDetail.put("persist", java.lang.Boolean.valueOf(persist))
+        stage.stageDetail.put("codecs", maskDataTransformCodecs.asJava)
 
         Right(stage)
       case _ =>
-        val allErrors: Errors = List(name, description, inputView, outputView, persist, invalidKeys).collect{ case Left(errs) => errs }.flatten
+        val allErrors: Errors = List(name, description, inputView, outputView, persist, passphrase, codecs, invalidKeys).collect{ case Left(errs) => errs }.flatten
         val stageName = stringOrDefault(name, "unnamed stage")
         val err = StageError(index, stageName, c.origin.lineNumber, allErrors)
         Left(err :: Nil)
     }
   }
+}
+
+object MaskDataTransform {
+  val passphraseEnvironmentVariable = "ETL_CONF_MASK_DATA_PASSPHRASE"
 }
 
 case class MaskDataTransformStage(
@@ -117,31 +125,23 @@ case class MaskDataTransformStage(
 
 sealed trait Treatment {}
 sealed trait CodecTreatment extends Treatment {
-  def codec: Codec
+  def codec: MaskDataTransformCodec
 }
 object Treatment {
   val MASK_KEY = "mask"
   val TREATMENT_KEY = "treatment"
-  val DEFAULT_SALT_BOOLEAN = """âbÆ¯h¸9Ü£¾m´¬ïAÎopúeýÊà]ú+^þ+úMÞV_òRþÖÞ¤"èôL_ç¾Æ;×s9ïÄeü3"#WqmM[""".getBytes
-  val DEFAULT_SALT_DATE = """öRßÌé_{U+Ñôô@zäZiz`)î5<*óUûºfì-÷êâ3zÊ'-.Ìº5'G§zT:Z$ä¹C9ê½ü{7)p!{""".getBytes
-  val DEFAULT_SALT_DECIMAL = """TÎA×GüMò-~Y×ã6Ö7\*¶.©}ÅM²5ûjMoÿLØ'ñydÍ°¤Jd`c(±@:]é¤Öó8Vç)m©]ØBæä""".getBytes
-  val DEFAULT_SALT_DOUBLE = """93à/iL"8¢£")ñ·Ï#¥b\æ;Epr³å;mX\AAÒ°_¢)ãj8Õ>ü+½ü´Å:5ðú]ëy½;ÓÌæ5^ÌA""".getBytes
-  val DEFAULT_SALT_INTEGER = """ªç9,V?`X&£fÒQÖÝ¤ëw/U9Q<á&_¹Âx\>»Ä^'ÜÑYóW7´©@Ûåó»(DF'm7u8:oÑcÆË>Á""".getBytes
-  val DEFAULT_SALT_LONG = """aúhYÊê÷EGÙ`fG?óÌ"@öT^w)5Ýo}L¼È^i¬EQ¨ãÒ,V±¨¶=³\¶ç[à³>¼°Üf.EtAÖßgþ""".getBytes
-  val DEFAULT_SALT_STRING = """i<ÜµUÐ©D§BYØbÃ±b+s'"ÇQÔË\6ÊUQKæåî%+¢;Gö§,övT¬Y$n7Ð£X¼,+&.Òú¶nRÜ)""".getBytes
-  val DEFAULT_SALT_TIMESTAMP = """äÌµ¨ö5¹¨?çeg±&b}ãÐç';@Á$ÊL·e¾*ïðxÏû\dW9¦:ê#G;HéÍ2@ú-rbw9¼øÙUPÒt[""".getBytes
 
   // date treatments
-  case class RandomDate(deterministic: Boolean, threshold: Long, codec: Codec, salt: Array[Byte]) extends CodecTreatment
+  case class RandomDate(deterministic: Boolean, threshold: Long, codec: MaskDataTransformCodec) extends CodecTreatment
   case class MonthDateTruncate() extends Treatment
   case class YearDateTruncate() extends Treatment
 
   // string treatments
-  case class RandomString(deterministic: Boolean, length: Int, codec: Codec, salt: Array[Byte]) extends CodecTreatment
-  case class RandomList(deterministic: Boolean, locale: String, list: String, codec: Codec, salt: Array[Byte]) extends CodecTreatment
-  case class RandomEmail(deterministic: Boolean, locale: String, codec: Codec, salt: Array[Byte]) extends CodecTreatment
+  case class RandomString(deterministic: Boolean, length: Int, alphabet: String, codec: MaskDataTransformCodec) extends CodecTreatment
+  case class RandomList(deterministic: Boolean, locale: String, list: String, codec: MaskDataTransformCodec) extends CodecTreatment
+  case class RandomEmail(deterministic: Boolean, locale: String, codec: MaskDataTransformCodec) extends CodecTreatment
 
-  def fromMetadata(field: StructField, passphrase: Option[String]): Option[Treatment] = {
+  def fromMetadata(maskDataTransformCodecs: Map[String, MaskDataTransformCodec], field: StructField): Option[Treatment] = {
     val metadata = field.metadata
 
     if (metadata.contains(MASK_KEY)) {
@@ -154,29 +154,51 @@ object Treatment {
                 if (field.dataType != DateType && field.dataType != TimestampType) {
                   throw new Exception(s"Data Masking treatment 'randomDate' can only be applied to 'date' or 'timestamp' type but field '${field.name}' is of type '${field.dataType.simpleString}'.")
                 }
+                val algorithm = Try(mask.getString("algorithm").trim) match {
+                  case Success(algo) => maskDataTransformCodecs.getOrElse(algo, throw new Exception(s"No codec named '${algo}'. Available codecs: ${maskDataTransformCodecs.keys.mkString("[", ", ", "]")}"))
+                  case _ => new Argon2Codec()
+                }
                 val deterministic = Try(mask.getBoolean("deterministic")) match {
                   case Success(value) => value
                   case Failure(_) => false
                 }
-                val threshold = mask.getLong("threshold")
-                Option(Treatment.RandomDate(deterministic, threshold, Argon2(), DEFAULT_SALT_DATE))
+                val threshold = Try(mask.getLong("threshold")) match {
+                  case Success(value) if (value == 0) => throw new Exception("Data Masking treatment 'randomDate' cannot be performed with 'threshold' set to 0.")
+                  case Success(value) => value
+                  case Failure(_) => 365L
+                }
+                Option(
+                  Treatment.RandomDate(
+                    deterministic,
+                    threshold,
+                    algorithm
+                  )
+                )
               }
               case Success("monthDateTruncate") => {
                 if (field.dataType != DateType && field.dataType != TimestampType) {
                   throw new Exception(s"Data Masking treatment 'monthDateTruncate' can only be applied to 'date' or 'timestamp' type but field '${field.name}' is of type '${field.dataType.simpleString}'.")
                 }
-                Option(Treatment.MonthDateTruncate())
+                Option(
+                  Treatment.MonthDateTruncate()
+                )
               }
               case Success("yearDateTruncate") => {
                 if (field.dataType != DateType && field.dataType != TimestampType) {
                   throw new Exception(s"Data Masking treatment 'yearDateTruncate' can only be applied to 'date' or 'timestamp' type but field '${field.name}' is of type '${field.dataType.simpleString}'.")
                 }
-                Option(Treatment.YearDateTruncate())
+                Option(
+                  Treatment.YearDateTruncate()
+                )
               }
 
               case Success("randomString") => {
                 if (field.dataType != StringType) {
                   throw new Exception(s"Data Masking treatment 'randomString' can only be applied to 'string' type but field '${field.name}' is of type '${field.dataType.simpleString}'.")
+                }
+                val algorithm = Try(mask.getString("algorithm").trim) match {
+                  case Success(algo) => maskDataTransformCodecs.getOrElse(algo, throw new Exception(s"No codec named '${algo}'. Available codecs: ${maskDataTransformCodecs.keys.mkString("[", ", ", "]")}"))
+                  case _ => new Argon2Codec()
                 }
                 val deterministic = Try(mask.getBoolean("deterministic")) match {
                   case Success(value) => value
@@ -186,11 +208,51 @@ object Treatment {
                   case Success(value) => value.toInt
                   case Failure(_) => 32
                 }
-                Option(Treatment.RandomString(deterministic, length, SCrypt(), DEFAULT_SALT_STRING))
+                val alphabet = Try(mask.getString("alphabet")) match {
+                  case Success(value) => value
+                  case Failure(_) => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                }
+                Option(
+                  Treatment.RandomString(
+                    deterministic,
+                    length,
+                    alphabet,
+                    algorithm
+                  )
+                )
+              }
+              case Success("randomNumberString") => {
+                if (field.dataType != StringType) {
+                  throw new Exception(s"Data Masking treatment 'randomNumberString' can only be applied to 'string' type but field '${field.name}' is of type '${field.dataType.simpleString}'.")
+                }
+                val algorithm = Try(mask.getString("algorithm").trim) match {
+                  case Success(algo) => maskDataTransformCodecs.getOrElse(algo, throw new Exception(s"No codec named '${algo}'. Available codecs: ${maskDataTransformCodecs.keys.mkString("[", ", ", "]")}"))
+                  case _ => new Argon2Codec()
+                }
+                val deterministic = Try(mask.getBoolean("deterministic")) match {
+                  case Success(value) => value
+                  case Failure(_) => false
+                }
+                val length = Try(mask.getLong("length")) match {
+                  case Success(value) => value.toInt
+                  case Failure(_) => 32
+                }
+                Option(
+                  Treatment.RandomString(
+                    deterministic,
+                    length,
+                    "0123456789",
+                    algorithm
+                  )
+                )
               }
               case Success("randomList") => {
                 if (field.dataType != StringType) {
                   throw new Exception(s"Data Masking treatment 'randomList' can only be applied to 'string' type but field '${field.name}' is of type '${field.dataType.simpleString}'.")
+                }
+                val algorithm = Try(mask.getString("algorithm").trim) match {
+                  case Success(algo) => maskDataTransformCodecs.getOrElse(algo, throw new Exception(s"No codec named '${algo}'. Available codecs: ${maskDataTransformCodecs.keys.mkString("[", ", ", "]")}"))
+                  case _ => new Argon2Codec()
                 }
                 val deterministic = Try(mask.getBoolean("deterministic")) match {
                   case Success(value) => value
@@ -211,7 +273,7 @@ object Treatment {
                     }
                   }
                   case Failure(_) => throw new Exception(s"Data Masking treatment 'randomList' requires 'locale' attribute.")
-                }                
+                }
                 val list = Try(mask.getString("list")) match {
                   case Success(value) => {
                     val keySet = Mask.localizedLists.get(locale).get.keySet
@@ -228,11 +290,22 @@ object Treatment {
                   }
                   case Failure(_) => throw new Exception(s"Data Masking treatment 'randomList' requires 'list' attribute.")
                 }
-                Option(Treatment.RandomList(deterministic, locale, list, PBKDF2WithHmacSHA512(), DEFAULT_SALT_STRING))
+                Option(
+                  Treatment.RandomList(
+                    deterministic,
+                    locale,
+                    list,
+                    algorithm
+                  )
+                )
               }
               case Success("randomEmail") => {
                 if (field.dataType != StringType) {
                   throw new Exception(s"Data Masking treatment 'randomEmail' can only be applied to 'string' type but field '${field.name}' is of type '${field.dataType.simpleString}'.")
+                }
+                val algorithm = Try(mask.getString("algorithm").trim) match {
+                  case Success(algo) => maskDataTransformCodecs.getOrElse(algo, throw new Exception(s"No codec named '${algo}'. Available codecs: ${maskDataTransformCodecs.keys.mkString("[", ", ", "]")}"))
+                  case _ => new Argon2Codec
                 }
                 val deterministic = Try(mask.getBoolean("deterministic")) match {
                   case Success(value) => value
@@ -253,8 +326,14 @@ object Treatment {
                     }
                   }
                   case Failure(_) => throw new Exception(s"Data Masking treatment 'randomEmail' requires 'locale' attribute.")
-                }                  
-                Option(Treatment.RandomEmail(deterministic, locale, PBKDF2WithHmacSHA512(), DEFAULT_SALT_STRING))
+                }
+                Option(
+                  Treatment.RandomEmail(
+                    deterministic,
+                    locale,
+                    algorithm
+                  )
+                )
               }
               case _ => None
             }
@@ -267,80 +346,41 @@ object Treatment {
   }
 }
 
-sealed trait Codec {
+trait MaskDataTransformCodec {
+  def sparkName(): String
+  def sparkString(): String
+  def getVersion(): String
+
   def encrypt(value: Array[Char], salt: Array[Byte]): Array[Byte]
 
-  def hash(value: String, salt: Array[Byte], deterministic: Boolean, passphrase: Option[String]): Array[Byte] = {
+  def hash(value: String, deterministic: Boolean, passphrase: Option[String]): Array[Byte] = {
     if (deterministic) {
-      encrypt(value.toCharArray ++ passphrase.getOrElse(throw new Exception("MaskDataTransform environment variable 'ETL_CONF_MASK_DATA_PASSPHRASE' is required for deterministic data masking.")).getBytes.map(_.toChar), salt)
+
+      val passphraseBytes = passphrase.getOrElse(throw new Exception(MaskDataTransformCodec.signature)).getBytes
+
+      val (pass, salt) = passphraseBytes.splitAt((passphraseBytes.length / 2))
+      encrypt(
+        value.toCharArray ++ pass.map(_.toChar),
+        salt
+      )
     } else {
       val secureRandom = new SecureRandom()
-      val randomBytes = new Array[Byte](Codec.DEFAULT_HASH_LENGTH)
+      val randomBytes = new Array[Byte](MaskDataTransformCodec.DEFAULT_HASH_LENGTH)
       secureRandom.nextBytes(randomBytes)
       randomBytes
     }
   }
 
   // ByteBuffer.wrap(bytes).getLong returns positive and negative values
-  def hashLong(value: String, salt: Array[Byte], deterministic: Boolean, passphrase: Option[String]): Long = {
-    ByteBuffer.wrap(hash(value, salt, deterministic, passphrase)).getLong
+  def hashLong(value: String, deterministic: Boolean, passphrase: Option[String]): Long = {
+    ByteBuffer.wrap(hash(value, deterministic, passphrase)).getLong
   }
 }
 
-object Codec {
+object MaskDataTransformCodec {
+  val signature = s"MaskDataTransform environment variable '${MaskDataTransform.passphraseEnvironmentVariable}' is required for deterministic data masking."
+
   val DEFAULT_HASH_LENGTH = 64
-}
-
-case class PBKDF2WithHmacSHA512(iterations: Option[Int] = None, keyLength: Option[Int] = None) extends Codec {
-	val DEFAULT_ITERATIONS = 262144
-	val DEFAULT_KEY_LENGTH = 512
-
-  def encrypt(value: Array[Char], salt: Array[Byte]): Array[Byte] = {
-    val secretKeyFactory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA512")
-
-    val keySpec = new PBEKeySpec(
-      value,
-      salt,
-      iterations.getOrElse(DEFAULT_ITERATIONS),
-      keyLength.getOrElse(DEFAULT_KEY_LENGTH)
-    )
-
-    val hash = secretKeyFactory.generateSecret(keySpec).getEncoded
-    keySpec.clearPassword
-    hash
-  }
-}
-
-case class Argon2(parallelism: Option[Int] = None, memory: Option[Int] = None, iterations: Option[Int] = None) extends Codec {
-	val DEFAULT_PARALLELISM = 1
-	val DEFAULT_MEMORY = 1 << 12
-  val DEFAULT_ITERATIONS = 3
-
-  def encrypt(value: Array[Char], salt: Array[Byte]): Array[Byte] = {
-
-    val params = new Argon2Parameters.Builder(Argon2Parameters.ARGON2_id)
-      .withSalt(salt)
-      .withParallelism(parallelism.getOrElse(DEFAULT_PARALLELISM))
-      .withMemoryAsKB(memory.getOrElse(DEFAULT_MEMORY))
-      .withIterations(iterations.getOrElse(DEFAULT_ITERATIONS))
-      .build()
-
-    val generator = new Argon2BytesGenerator()
-    generator.init(params)
-    val hash = new Array[Byte](Codec.DEFAULT_HASH_LENGTH)
-    generator.generateBytes(value, hash)
-    hash
-  }
-}
-
-case class SCrypt(parallelism: Option[Int] = None, memory: Option[Int] = None, cpu: Option[Int] = None) extends Codec {
-	val DEFAULT_PARALLELISM = 1
-	val DEFAULT_MEMORY = 8
-  val DEFAULT_CPU = 16384
-
-  def encrypt(value: Array[Char], salt: Array[Byte]): Array[Byte] = {
-    org.bouncycastle.crypto.generators.SCrypt.generate(value.map(_.toByte), salt, cpu.getOrElse(DEFAULT_CPU), memory.getOrElse(DEFAULT_MEMORY), parallelism.getOrElse(DEFAULT_PARALLELISM), Codec.DEFAULT_HASH_LENGTH)
-  }
 }
 
 object MaskDataTransformStage {
@@ -375,73 +415,81 @@ object MaskDataTransformStage {
             // get the schema
             val schema = bufferedPartition.head.schema
 
+            // load codecs. these are not serializable so have to be re-initalised on each executor
+            val serviceLoader = Utils.getContextOrSparkClassLoader
+            val maskDataTransformCodecs = ServiceLoader.load(classOf[MaskDataTransformCodec], serviceLoader).iterator().asScala.toList.map { codec => (codec.sparkName, codec) }.toMap
+
             // create an array of tuple(DataType, Option[Treatement to apply], field index to apply to)
             val treatments = schema.fields
               .zipWithIndex
-              .map { case (field, index) => (field.dataType, Treatment.fromMetadata(field, passphrase), index) }
+              .map { case (field, index) => (field.dataType, Treatment.fromMetadata(maskDataTransformCodecs, field), index) }
 
-            // set up useful objects
-            val base32 = new Base32()
-            val secureRandom = new SecureRandom()
+            def encodeAsString(bytes: Array[Byte], alphabet: String) = bytes.map { byte => alphabet(Math.abs(byte.toInt) % alphabet.length) }.mkString
+            def truncateString(value: String, length: Int, algorithm: String): String = {
+              if (value.length < length) {
+                throw new Exception(s"'${algorithm}' cannot produce required ${length} length output based on the input")
+              }
+              value.substring(0, length)
+            }
             val utcZoneId = ZoneId.of("UTC")
 
             bufferedPartition.map { row =>
               val masked = treatments.foldLeft[Seq[Any]](row.toSeq) { case (state, (dataType, treatment, index)) =>
-                treatment match {
+                (treatment, dataType) match {
 
-                  case None =>
+                  case (None, _) =>
                     nonMaskedAccumulator.add(1)
                     state
 
-                  case Some(_) if row.isNullAt(index) =>
+                  case (Some(_), _) if row.isNullAt(index) =>
                     nonMaskedAccumulator.add(1)
                     state
 
-                  case Some(_: Treatment.MonthDateTruncate) if dataType == DateType =>
+                  case (Some(_: Treatment.MonthDateTruncate), DateType) =>
                     maskedAccumulator.add(1)
                     state.updated(index, Date.valueOf(row.getDate(index).toLocalDate.withDayOfMonth(1)))
 
-                  case Some(_: Treatment.MonthDateTruncate) if dataType == TimestampType =>
+                  case (Some(_: Treatment.MonthDateTruncate), TimestampType) =>
                     maskedAccumulator.add(1)
                     val timestamp = row.getTimestamp(index)
                     state.updated(index, Timestamp.from(timestamp.toInstant.atZone(utcZoneId).withDayOfMonth(1).toInstant))
 
-                  case Some(_: Treatment.YearDateTruncate) if dataType == DateType =>
+                  case (Some(_: Treatment.YearDateTruncate), DateType) =>
                     maskedAccumulator.add(1)
                     state.updated(index, Date.valueOf(row.getDate(index).toLocalDate.withDayOfMonth(1).withMonth(1)))
 
-                  case Some(_: Treatment.YearDateTruncate) if dataType == TimestampType =>
+                  case (Some(_: Treatment.YearDateTruncate), TimestampType) =>
                     maskedAccumulator.add(1)
                     val timestamp = row.getTimestamp(index)
                     state.updated(index, Timestamp.from(timestamp.toInstant.atZone(utcZoneId).withDayOfMonth(1).withMonth(1).toInstant))
 
-                  case Some(t: Treatment.RandomDate) if dataType == DateType =>
+                  case (Some(t: Treatment.RandomDate), DateType) =>
                     maskedAccumulator.add(1)
                     val date = row.getDate(index)
-                    val numDays = t.codec.hashLong(date.toString, t.salt, t.deterministic, passphrase) % t.threshold
+                    val numDays = t.codec.hashLong(date.toString, t.deterministic, passphrase) % t.threshold
                     state.updated(index, Date.valueOf(date.toLocalDate.plusDays(numDays)))
 
-                  case Some(t: Treatment.RandomDate) if dataType == TimestampType =>
+                  case (Some(t: Treatment.RandomDate), TimestampType) =>
                     maskedAccumulator.add(1)
                     val timestamp = row.getTimestamp(index)
-                    val numDays = t.codec.hashLong(timestamp.toString, t.salt, t.deterministic, passphrase) % t.threshold
+                    val numDays = t.codec.hashLong(timestamp.toString, t.deterministic, passphrase) % t.threshold
                     state.updated(index, Timestamp.from(timestamp.toInstant.plus(numDays, ChronoUnit.DAYS)))
 
-                  case Some(t: Treatment.RandomString) =>
+                  case (Some(t: Treatment.RandomString), StringType) =>
                     maskedAccumulator.add(1)
                     val string = row.getString(index)
-                    state.updated(index, base32.encodeAsString(t.codec.hash(string, t.salt, t.deterministic, passphrase)).substring(0, t.length))
+                    state.updated(index, truncateString(encodeAsString(t.codec.hash(string, t.deterministic, passphrase), t.alphabet), t.length, t.codec.sparkString()))
 
-                  case Some(t: Treatment.RandomList) =>
+                  case (Some(t: Treatment.RandomList), StringType) =>
                     maskedAccumulator.add(1)
                     val string = row.getString(index)
                     val localisedList = Mask.localizedLists.get(t.locale).get.get(t.list).get
-                    state.updated(index, localisedList(Math.abs(t.codec.hashLong(string, t.salt, t.deterministic, passphrase) % localisedList.length).toInt))
+                    state.updated(index, localisedList(Math.abs(t.codec.hashLong(string, t.deterministic, passphrase) % localisedList.length).toInt))
 
-                  case Some(t: Treatment.RandomEmail) =>
+                  case (Some(t: Treatment.RandomEmail), StringType) =>
                     maskedAccumulator.add(1)
                     val string = row.getString(index)
-                    val longBytes = t.codec.hashLong(string, t.salt, t.deterministic, passphrase)
+                    val longBytes = t.codec.hashLong(string, t.deterministic, passphrase)
 
                     val first_name = Mask.localizedLists.get(t.locale).get.get("first_name_female").get ++ Mask.localizedLists.get(t.locale).get.get("first_name_male").get
                     val free_email = Mask.localizedLists.get(t.locale).get.get("free_email").get

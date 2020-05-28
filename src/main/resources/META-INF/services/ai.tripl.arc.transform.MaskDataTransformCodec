@@ -1,0 +1,3 @@
+ai.tripl.arc.transform.codec.Argon2Codec
+ai.tripl.arc.transform.codec.PBKDF2WithHmacSHA512Codec
+ai.tripl.arc.transform.codec.SCryptCodec

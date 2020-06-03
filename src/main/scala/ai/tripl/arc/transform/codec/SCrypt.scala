@@ -5,9 +5,9 @@ import scala.util.Properties._
 import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.PBEKeySpec
 
-import ai.tripl.arc.transform.MaskDataTransformCodec
+import ai.tripl.arc.plugins.udf.MaskDataTransformCodec
 
-class SCryptCodec extends MaskDataTransformCodec {
+class SCrypt extends MaskDataTransformCodec with Serializable {
   val DEFAULT_PARALLELISM = 1
   val DEFAULT_MEMORY = 8
   val DEFAULT_CPU = 16384
@@ -27,7 +27,7 @@ class SCryptCodec extends MaskDataTransformCodec {
       cpu,
       memory,
       parallelism,
-      MaskDataTransformCodec.DEFAULT_HASH_LENGTH
+      DEFAULT_HASH_LENGTH
     )
   }
 

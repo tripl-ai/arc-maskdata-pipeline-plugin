@@ -5,12 +5,12 @@ import scala.util.Properties._
 import org.bouncycastle.crypto.generators._
 import org.bouncycastle.crypto.params._
 
-import ai.tripl.arc.transform.MaskDataTransformCodec
+import ai.tripl.arc.plugins.udf.MaskDataTransformCodec
 
-class Argon2Codec extends MaskDataTransformCodec {
-  val DEFAULT_PARALLELISM = 1
-  val DEFAULT_MEMORY = 131072
-  val DEFAULT_ITERATIONS = 8
+class Argon2 extends MaskDataTransformCodec with Serializable {
+  val DEFAULT_PARALLELISM = 2
+  val DEFAULT_MEMORY = 65536
+  val DEFAULT_ITERATIONS = 4
 
   val parallelism = envOrNone("ETL_CONF_MASK_DATA_ARGON2_PARALLELISM").map(_.toInt).getOrElse(DEFAULT_PARALLELISM)
   val memory = envOrNone("ETL_CONF_MASK_DATA_ARGON2_MEMORY").map(_.toInt).getOrElse(DEFAULT_MEMORY)
@@ -31,7 +31,7 @@ class Argon2Codec extends MaskDataTransformCodec {
 
     val generator = new Argon2BytesGenerator()
     generator.init(params)
-    val hash = new Array[Byte](MaskDataTransformCodec.DEFAULT_HASH_LENGTH)
+    val hash = new Array[Byte](DEFAULT_HASH_LENGTH)
     generator.generateBytes(value, hash)
     hash
   }

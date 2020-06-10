@@ -68,7 +68,7 @@ class MaskDataTransform extends PipelineStagePlugin {
           inputView=inputView,
           outputView=outputView,
           persist=persist,
-          params=params,
+          params=params
         )
 
         stage.stageDetail.put("inputView", inputView)

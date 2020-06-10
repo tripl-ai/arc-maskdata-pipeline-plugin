@@ -40,6 +40,8 @@ lazy val root = (project in file(".")).
     resolvers += "Sonatype OSS Staging" at "https://oss.sonatype.org/content/groups/staging"    
   )    
 
+resolvers += Resolver.mavenLocal
+publishM2Configuration := publishM2Configuration.value.withOverwrite(true)
 
 fork in run := true  
 
